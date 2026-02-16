@@ -10,6 +10,13 @@
 Reading real conversations in your target language is a fast way to build comprehension.
 Lingo removes friction by translating as messages appear, so Discord becomes daily language practice.
 
+## Features
+
+- Context-aware translations that handle slang and casual phrasing better.
+- Multi-language support (137+ languages).
+- Translation caching to reduce requests and processing overhead.
+- Fallback backend support for better reliability.
+
 ## Screenshots
 
 <table align="center">
