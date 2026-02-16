@@ -12,9 +12,22 @@ Lingo removes friction by translating as messages appear, so Discord becomes dai
 
 ## Screenshots
 
-![Lingo in chat](./images/lingo-message-view.png)
-![Lingo settings](./images/lingo-settings.png)
-![Lingo original toggle](./images/lingo-toggle-original.png)
+<table align="center">
+  <tr>
+    <td align="left">
+      <img src="./images/lingo-message-view.png" alt="Lingo in chat" width="430" />
+    </td>
+    <td width="40"></td>
+    <td align="right">
+      <img src="./images/lingo-toggle-original.png" alt="Lingo original toggle" width="430" />
+    </td>
+  </tr>
+  <tr>
+    <td colspan="3" align="center">
+      <img src="./images/lingo-settings.png" alt="Lingo settings" width="900" />
+    </td>
+  </tr>
+</table>
 
 ## Quick Start
 
