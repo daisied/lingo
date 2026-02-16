@@ -3,8 +3,7 @@
 </p>
 
 <h1 align="center">Lingo</h1>
-
-Lingo is a Vencord language-learning plugin that auto-translates incoming messages into your target language, while keeping the original text one click away.
+<p align="center">Language-learning plugin for Vencord with automatic chat translation.</p>
 
 ## Why
 
