@@ -3,7 +3,7 @@
 </p>
 
 <h1 align="center">Lingo</h1>
-<p align="center">Language-learning plugin for Vencord with automatic chat translation.</p>
+<p align="center">Language-learning plugin for Vencord with automatic chat translation, with support for 137+ languages.</p>
 
 ## Why
 
