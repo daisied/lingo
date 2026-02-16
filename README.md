@@ -1,4 +1,8 @@
-# Lingo
+<p align="center">
+  <img src="./images/lingo-header.png" alt="Lingo" />
+</p>
+
+<h1 align="center">Lingo</h1>
 
 Lingo is a Vencord language-learning plugin that auto-translates incoming messages into your target language, while keeping the original text one click away.
 
