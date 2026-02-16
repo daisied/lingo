@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./images/lingo-header.png" alt="Lingo" />
+  <img src="./images/lingo-header.png" alt="Lingo" width="400" />
 </p>
 
 <h1 align="center">Lingo</h1>
