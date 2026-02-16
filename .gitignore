@@ -1,0 +1,4 @@
+Vencord/
+node_modules/
+dist/
+*.log
