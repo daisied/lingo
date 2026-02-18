@@ -812,13 +812,20 @@ function LingoAccessory({ message }: { message: Message; }) {
     useEffect(() => {
         if (!shouldTranslate) return;
 
+        // Prevent async layout shifts while scrolling: do not mutate off-screen messages
+        // when visible-only mode is enabled.
+        if (onlyTranslateVisible && !isVisible) {
+            restoreOriginalMessage(message.id);
+            return;
+        }
+
         if (translation.status === "ready" && !showOriginal) {
             replaceMessageWithTranslation(message.id, translation.text);
             return;
         }
 
         restoreOriginalMessage(message.id);
-    }, [message.id, shouldTranslate, showOriginal, translation]);
+    }, [message.id, shouldTranslate, showOriginal, translation, onlyTranslateVisible, isVisible]);
 
     useEffect(() => {
         if (translation.status === "error") {
