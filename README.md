@@ -10,6 +10,14 @@
 Reading real conversations in your target language is a fast way to build comprehension.
 Lingo removes friction by translating as messages appear, so Discord becomes daily language practice.
 
+## Quick Install (Windows, Latest Release)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://github.com/daisied/lingo/releases/latest/download/Lingo-Windows-NoNpm.zip';$z=Join-Path $env:TEMP 'Lingo-Windows-NoNpm.zip';$d=Join-Path $env:TEMP 'Lingo-Windows-NoNpm';if(Test-Path $d){Remove-Item $d -Recurse -Force};Invoke-WebRequest $u -OutFile $z;Expand-Archive -Path $z -DestinationPath $d -Force;Start-Process -FilePath (Join-Path $d 'install-stable.bat')"
+```
+
+It is long because it does download, extract, and installer launch in one command. This is the fastest setup path for most users. If you want a source build/custom setup, use **Quick Start** below.
+
 ## Features
 
 - Context-aware translations that handle slang and casual phrasing better.
@@ -57,10 +65,6 @@ Lingo removes friction by translating as messages appear, so Discord becomes dai
 2. Create the shareable zip:
    - `powershell -ExecutionPolicy Bypass -File .\scripts\build-windows-no-npm-release.ps1`
 3. Share `release/Lingo-Windows-NoNpm.zip`.
-
-### One-Line Install (Latest Release)
-
-`powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://github.com/daisied/lingo/releases/latest/download/Lingo-Windows-NoNpm.zip';$z=Join-Path $env:TEMP 'Lingo-Windows-NoNpm.zip';$d=Join-Path $env:TEMP 'Lingo-Windows-NoNpm';if(Test-Path $d){Remove-Item $d -Recurse -Force};Invoke-WebRequest $u -OutFile $z;Expand-Archive -Path $z -DestinationPath $d -Force;Start-Process -FilePath (Join-Path $d 'install-stable.bat')"`
 
 ### Auto Release on Push
 
