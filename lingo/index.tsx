@@ -91,8 +91,8 @@ const messageVisibilityState = new Map<string, boolean>();
 const MAX_IN_MEMORY_TRANSLATIONS = 2500;
 const ORIGINAL_CONTENT_FIELD = "vcLingoOriginalContent";
 const TRANSLATED_CONTENT_FIELD = "vcLingoTranslatedContent";
-const MESSAGE_MUTATION_FLUSH_BATCH_SIZE = 4;
-const MESSAGE_MUTATION_FLUSH_DELAY_MS = 60;
+const MESSAGE_MUTATION_FLUSH_BATCH_SIZE = 6;
+const MESSAGE_MUTATION_FLUSH_DELAY_MS = 24;
 let activeRequests = 0;
 let persistentCacheLoaded = false;
 let persistentCacheLoadPromise: Promise<void> | null = null;
@@ -137,7 +137,7 @@ function markScrollActivity() {
     scrollIdleTimer = setTimeout(() => {
         scrollIdleTimer = null;
         setScrollActive(false);
-    }, 900);
+    }, 320);
 }
 
 function subscribeToScrollState(onChange: (isScrolling: boolean) => void) {
@@ -185,7 +185,7 @@ function flushPendingMessageMutations() {
     for (const [messageId, mutation] of pendingMessageMutations) {
         pendingMessageMutations.delete(messageId);
 
-        updateMessage(mutation.channelId, messageId, {
+        safeUpdateMessage(mutation.channelId, messageId, {
             content: mutation.content,
             [ORIGINAL_CONTENT_FIELD]: mutation.originalContent,
             [TRANSLATED_CONTENT_FIELD]: mutation.translatedContent
@@ -217,7 +217,16 @@ function enqueueMessageMutation(messageId: string, mutation: {
     }
 
     pendingMessageMutations.set(messageId, mutation);
+
     scheduleMessageMutationFlush();
+}
+
+function safeUpdateMessage(channelId: string, messageId: string, payload: any) {
+    try {
+        updateMessage(channelId, messageId, payload);
+    } catch {
+        // Avoid hard-failing the renderer if Discord internals reject an update.
+    }
 }
 
 function notifyVisibilitySubscribers(messageId: string, isVisible: boolean) {
@@ -301,7 +310,7 @@ function subscribeToMessageVisibility(messageId: string, onChange: (isVisible: b
 function invalidateAllTranslations() {
     clearTranslationCaches();
     for (const [messageId, entry] of translatedMessageState) {
-        updateMessage(entry.channelId, messageId, {
+        safeUpdateMessage(entry.channelId, messageId, {
             content: entry.originalContent,
             [ORIGINAL_CONTENT_FIELD]: entry.originalContent,
             [TRANSLATED_CONTENT_FIELD]: entry.translatedContent
@@ -583,6 +592,17 @@ function getTranslatorConfigFingerprint(): string {
 }
 
 function getOriginalMessageContent(message: Message): string {
+    const tracked = translatedMessageState.get(message.id);
+    if (tracked) {
+        if ((message.content ?? "") === tracked.translatedContent) {
+            return tracked.originalContent;
+        }
+
+        if ((message.content ?? "") === tracked.originalContent) {
+            return tracked.originalContent;
+        }
+    }
+
     const lingoMessage = message as LingoMessage;
     const original = lingoMessage[ORIGINAL_CONTENT_FIELD];
     const translated = lingoMessage[TRANSLATED_CONTENT_FIELD];
@@ -808,15 +828,15 @@ function getMessageNode(messageId: string) {
 }
 
 function restoreOriginalMessage(message: Message, sourceContent: string) {
+    const tracked = translatedMessageState.get(message.id);
     const lingoMessage = message as LingoMessage;
     const currentContent = message.content ?? "";
-    const originalContent = sourceContent;
+    const originalContent = tracked?.originalContent ?? sourceContent;
     const translatedContent =
-        typeof lingoMessage[TRANSLATED_CONTENT_FIELD] === "string"
-            ? lingoMessage[TRANSLATED_CONTENT_FIELD]
-            : "";
-
-    translatedMessageState.delete(message.id);
+        tracked?.translatedContent
+            ?? (typeof lingoMessage[TRANSLATED_CONTENT_FIELD] === "string"
+                ? lingoMessage[TRANSLATED_CONTENT_FIELD]
+                : "");
 
     if (currentContent === originalContent && !pendingMessageMutations.has(message.id)) {
         return;
@@ -952,7 +972,7 @@ function LingoAccessory({ message }: { message: Message; }) {
         setVisibilitySettled(false);
         const timer = setTimeout(() => {
             setVisibilitySettled(true);
-        }, 220);
+        }, 120);
 
         return () => {
             clearTimeout(timer);
@@ -965,7 +985,7 @@ function LingoAccessory({ message }: { message: Message; }) {
     }, [message.id, sourceContent, translatorConfigFingerprint]);
 
     useEffect(() => {
-        if (!shouldTranslate || isScrolling || (onlyTranslateVisible && (!isVisible || !visibilitySettled))) return;
+        if (!shouldTranslate || (onlyTranslateVisible && (!isVisible || !visibilitySettled))) return;
 
         const key = getMessageCacheKey(message.id, sourceContent, translatorConfigFingerprint);
         const cached = translationCache.get(key);
@@ -984,10 +1004,16 @@ function LingoAccessory({ message }: { message: Message; }) {
         return () => {
             cancelled = true;
         };
-    }, [message.id, sourceContent, shouldTranslate, isVisible, visibilitySettled, onlyTranslateVisible, isScrolling, translatorConfigFingerprint]);
+    }, [message.id, sourceContent, shouldTranslate, isVisible, visibilitySettled, onlyTranslateVisible, translatorConfigFingerprint]);
 
     useEffect(() => {
         if (!shouldTranslate) {
+            restoreOriginalMessage(message, sourceContent);
+            return;
+        }
+
+        // Manual toggle must always be responsive, even while scroll tracking is active.
+        if (showOriginal) {
             restoreOriginalMessage(message, sourceContent);
             return;
         }
@@ -1003,10 +1029,6 @@ function LingoAccessory({ message }: { message: Message; }) {
         if (translation.status === "ready" && !showOriginal) {
             replaceMessageWithTranslation(message, sourceContent, translation.text);
             return;
-        }
-
-        if (showOriginal) {
-            restoreOriginalMessage(message, sourceContent);
         }
     }, [message, sourceContent, shouldTranslate, showOriginal, translation, onlyTranslateVisible, isVisible, visibilitySettled, isScrolling]);
 
@@ -1063,7 +1085,6 @@ export default definePlugin({
             markScrollActivity();
         };
         window.addEventListener("wheel", windowScrollHandler, { passive: true });
-        window.addEventListener("scroll", windowScrollHandler, { passive: true, capture: true });
         window.addEventListener("keydown", windowKeydownHandler, { passive: true });
         window.addEventListener("touchmove", windowTouchMoveHandler, { passive: true });
         addMessageAccessory(PLUGIN_ID, ({ message }) => <LingoAccessory message={message} />);
@@ -1073,7 +1094,6 @@ export default definePlugin({
     stop() {
         if (windowScrollHandler) {
             window.removeEventListener("wheel", windowScrollHandler as EventListener);
-            window.removeEventListener("scroll", windowScrollHandler as EventListener, true);
             windowScrollHandler = null;
         }
         if (windowKeydownHandler) {
