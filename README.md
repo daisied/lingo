@@ -58,6 +58,14 @@ Lingo removes friction by translating as messages appear, so Discord becomes dai
    - `powershell -ExecutionPolicy Bypass -File .\scripts\build-windows-no-npm-release.ps1`
 3. Share `release/Lingo-Windows-NoNpm.zip`.
 
+### One-Line Install (Latest Release)
+
+`powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://github.com/daisied/lingo/releases/latest/download/Lingo-Windows-NoNpm.zip';$z=Join-Path $env:TEMP 'Lingo-Windows-NoNpm.zip';$d=Join-Path $env:TEMP 'Lingo-Windows-NoNpm';if(Test-Path $d){Remove-Item $d -Recurse -Force};Invoke-WebRequest $u -OutFile $z;Expand-Archive -Path $z -DestinationPath $d -Force;Start-Process -FilePath (Join-Path $d 'install-stable.bat')"`
+
+### Auto Release on Push
+
+Every push to `main` now runs `.github/workflows/release-windows-no-npm.yml`, builds a fresh Windows no-npm bundle, and publishes `Lingo-Windows-NoNpm.zip` to GitHub Releases.
+
 ## Notes
 
 - `native.ts` is included for Azure Translator support.

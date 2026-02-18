@@ -1,0 +1,53 @@
+name: Release Windows NoNpm Bundle
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Vencord dependencies
+        working-directory: Vencord
+        run: npm install
+
+      - name: Build Vencord
+        working-directory: Vencord
+        run: npm run build
+
+      - name: Build Windows no-npm bundle
+        shell: pwsh
+        run: ./scripts/build-windows-no-npm-release.ps1
+
+      - name: Prepare release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $short = "${{ github.sha }}".Substring(0, 7)
+          "tag_name=auto-$short" >> $env:GITHUB_OUTPUT
+          "release_name=Lingo Windows Build auto-$short" >> $env:GITHUB_OUTPUT
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag_name }}
+          name: ${{ steps.meta.outputs.release_name }}
+          make_latest: true
+          generate_release_notes: true
+          files: |
+            release/Lingo-Windows-NoNpm.zip
