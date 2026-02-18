@@ -76,16 +76,108 @@ const inFlightRequests = new Map<string, Promise<TranslationState>>();
 const persistentTranslationMemory = new Map<string, PersistentTranslationEntry>();
 const originalMessageHtml = new Map<string, string>();
 const requestQueue: Array<() => void> = [];
+const visibilitySubscribers = new Map<string, Set<(visible: boolean) => void>>();
+const observedMessageNodes = new Map<string, HTMLElement>();
+const messageVisibilityState = new Map<string, boolean>();
+const MAX_IN_MEMORY_TRANSLATIONS = 2500;
+const MAX_ACTIVE_DOM_REPLACEMENTS = 250;
 let activeRequests = 0;
 let persistentCacheLoaded = false;
 let persistentCacheLoadPromise: Promise<void> | null = null;
 let persistMemoryTimer: ReturnType<typeof setTimeout> | null = null;
+let sharedVisibilityObserver: IntersectionObserver | null = null;
 
 function clearTranslationCaches() {
     translationCache.clear();
     inFlightRequests.clear();
     requestQueue.length = 0;
     activeRequests = 0;
+}
+
+function pruneInMemoryTranslationCache() {
+    while (translationCache.size > MAX_IN_MEMORY_TRANSLATIONS) {
+        const oldestKey = translationCache.keys().next().value as string | undefined;
+        if (!oldestKey) break;
+        translationCache.delete(oldestKey);
+    }
+}
+
+function notifyVisibilitySubscribers(messageId: string, isVisible: boolean) {
+    const subscribers = visibilitySubscribers.get(messageId);
+    if (!subscribers?.size) return;
+
+    for (const subscriber of subscribers) {
+        subscriber(isVisible);
+    }
+}
+
+function ensureSharedVisibilityObserver() {
+    if (sharedVisibilityObserver || !("IntersectionObserver" in window)) return sharedVisibilityObserver;
+
+    sharedVisibilityObserver = new IntersectionObserver(entries => {
+        for (const entry of entries) {
+            const id = (entry.target as HTMLElement).id;
+            if (!id.startsWith("message-content-")) continue;
+
+            const messageId = id.slice("message-content-".length);
+            const isVisible = entry.isIntersecting;
+
+            if (messageVisibilityState.get(messageId) === isVisible) continue;
+            messageVisibilityState.set(messageId, isVisible);
+            notifyVisibilitySubscribers(messageId, isVisible);
+        }
+    });
+
+    return sharedVisibilityObserver;
+}
+
+function tryObserveMessageVisibility(messageId: string): boolean {
+    const observer = ensureSharedVisibilityObserver();
+    if (!observer) return false;
+
+    const node = getMessageNode(messageId);
+    if (!node) return false;
+
+    const existing = observedMessageNodes.get(messageId);
+    if (existing === node) return true;
+
+    if (existing) {
+        observer.unobserve(existing);
+    }
+
+    observedMessageNodes.set(messageId, node);
+    observer.observe(node);
+    return true;
+}
+
+function subscribeToMessageVisibility(messageId: string, onChange: (isVisible: boolean) => void) {
+    let subscribers = visibilitySubscribers.get(messageId);
+    if (!subscribers) {
+        subscribers = new Set();
+        visibilitySubscribers.set(messageId, subscribers);
+    }
+
+    subscribers.add(onChange);
+    onChange(messageVisibilityState.get(messageId) ?? false);
+
+    return () => {
+        const current = visibilitySubscribers.get(messageId);
+        if (!current) return;
+
+        current.delete(onChange);
+        if (current.size > 0) return;
+
+        visibilitySubscribers.delete(messageId);
+
+        const observer = ensureSharedVisibilityObserver();
+        const observedNode = observedMessageNodes.get(messageId);
+        if (observer && observedNode) {
+            observer.unobserve(observedNode);
+        }
+
+        observedMessageNodes.delete(messageId);
+        messageVisibilityState.delete(messageId);
+    };
 }
 
 function invalidateAllTranslations() {
@@ -514,6 +606,8 @@ async function fetchTranslation(text: string, targetLanguage: string): Promise<T
 
 function scheduleTranslation<T>(task: () => Promise<T>): Promise<T> {
     return new Promise((resolve, reject) => {
+        const maxConcurrentRequests = Math.max(1, settings.store.maxConcurrentRequests || 1);
+
         const run = () => {
             activeRequests++;
 
@@ -525,7 +619,7 @@ function scheduleTranslation<T>(task: () => Promise<T>): Promise<T> {
                 });
         };
 
-        if (activeRequests < settings.store.maxConcurrentRequests) {
+        if (activeRequests < maxConcurrentRequests) {
             run();
         } else {
             requestQueue.push(run);
@@ -552,11 +646,22 @@ function requestTranslation(message: Message, translatorConfigFingerprint: strin
         const result = await scheduleTranslation(() => fetchTranslation(messageText, targetLanguage));
         rememberPersistentTranslation(messageText, translatorConfigFingerprint, result);
         return result;
-    })().then(result => {
-        translationCache.set(key, result);
-        inFlightRequests.delete(key);
-        return result;
-    });
+    })()
+        .then(result => {
+            translationCache.set(key, result);
+            pruneInMemoryTranslationCache();
+            return result;
+        })
+        .catch(error => {
+            const message = error instanceof Error ? error.message : "translation unavailable";
+            const fallback: TranslationState = { status: "error", message };
+            translationCache.set(key, fallback);
+            pruneInMemoryTranslationCache();
+            return fallback;
+        })
+        .finally(() => {
+            inFlightRequests.delete(key);
+        });
 
     inFlightRequests.set(key, request);
     return request;
@@ -568,16 +673,25 @@ function getMessageNode(messageId: string) {
 
 function restoreOriginalMessage(messageId: string) {
     const messageNode = getMessageNode(messageId);
-    if (!messageNode) return;
+    if (!messageNode) {
+        originalMessageHtml.delete(messageId);
+        return;
+    }
 
     const original = originalMessageHtml.get(messageId);
-    if (!original) return;
+    if (!original) {
+        delete messageNode.dataset.vcLingoTranslated;
+        delete messageNode.dataset.vcAutoSwedishTranslated;
+        return;
+    }
 
     if (messageNode.dataset.vcLingoTranslated === "true" || messageNode.dataset.vcAutoSwedishTranslated === "true") {
         messageNode.innerHTML = original;
         delete messageNode.dataset.vcLingoTranslated;
         delete messageNode.dataset.vcAutoSwedishTranslated;
     }
+
+    originalMessageHtml.delete(messageId);
 }
 
 function replaceMessageWithTranslation(messageId: string, translatedText: string) {
@@ -585,6 +699,10 @@ function replaceMessageWithTranslation(messageId: string, translatedText: string
     if (!messageNode) return;
 
     if (!originalMessageHtml.has(messageId)) {
+        if (originalMessageHtml.size >= MAX_ACTIVE_DOM_REPLACEMENTS) {
+            return;
+        }
+
         originalMessageHtml.set(messageId, messageNode.innerHTML);
     }
 
@@ -593,7 +711,7 @@ function replaceMessageWithTranslation(messageId: string, translatedText: string
 }
 
 function useMessageVisibility(messageId: string): boolean {
-    const [isVisible, setVisible] = useState(false);
+    const [isVisible, setVisible] = useState(!("IntersectionObserver" in window));
 
     useEffect(() => {
         if (!("IntersectionObserver" in window)) {
@@ -601,18 +719,30 @@ function useMessageVisibility(messageId: string): boolean {
             return;
         }
 
-        const node = getMessageNode(messageId);
-        if (!node) {
-            setVisible(true);
-            return;
-        }
+        let disposed = false;
+        let attempts = 0;
+        let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-        const observer = new IntersectionObserver(entries => {
-            setVisible(entries.some(entry => entry.isIntersecting));
-        });
+        const unsubscribe = subscribeToMessageVisibility(messageId, setVisible);
 
-        observer.observe(node);
-        return () => observer.disconnect();
+        const attachObserver = () => {
+            if (disposed) return;
+            if (tryObserveMessageVisibility(messageId)) return;
+            if (attempts >= 40) return;
+
+            attempts++;
+            retryTimer = setTimeout(attachObserver, 50);
+        };
+
+        attachObserver();
+
+        return () => {
+            disposed = true;
+            if (retryTimer) {
+                clearTimeout(retryTimer);
+            }
+            unsubscribe();
+        };
     }, [messageId]);
 
     return isVisible;
@@ -741,6 +871,11 @@ export default definePlugin({
             clearTimeout(persistMemoryTimer);
             persistMemoryTimer = null;
         }
+        sharedVisibilityObserver?.disconnect();
+        sharedVisibilityObserver = null;
+        visibilitySubscribers.clear();
+        observedMessageNodes.clear();
+        messageVisibilityState.clear();
         void persistMemoryNow();
         invalidateAllTranslations();
     }
