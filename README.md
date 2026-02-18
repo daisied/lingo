@@ -49,6 +49,15 @@ Lingo removes friction by translating as messages appear, so Discord becomes dai
 5. Fully restart Discord.
 6. Enable `Lingo` in Vencord settings and set your target language.
 
+## Friend Release Bundle (Windows, no npm)
+
+1. Build Vencord first:
+   - `cd Vencord`
+   - `npm run build`
+2. Create the shareable zip:
+   - `powershell -ExecutionPolicy Bypass -File .\scripts\build-windows-no-npm-release.ps1`
+3. Share `release/Lingo-Windows-NoNpm.zip`.
+
 ## Notes
 
 - `native.ts` is included for Azure Translator support.

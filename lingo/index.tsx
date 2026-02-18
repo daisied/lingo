@@ -9,6 +9,7 @@ import "./styles.css";
 import * as DataStore from "@api/DataStore";
 import { definePluginSettings } from "@api/Settings";
 import { addMessageAccessory, removeMessageAccessory } from "@api/MessageAccessories";
+import { updateMessage } from "@api/MessageUpdater";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { Message } from "@vencord/discord-types";
 import { UserStore, useEffect, useState } from "@webpack/common";
@@ -55,6 +56,8 @@ interface PersistentTranslationEntry {
     lastUsedAt: number;
 }
 
+type LingoMessage = Message & Record<string, any>;
+
 const Native = VencordNative.pluginHelpers.Lingo as PluginNative<typeof import("./native")>;
 
 type TranslationState =
@@ -74,24 +77,76 @@ const LEGACY_PERSISTENT_CACHE_DATASTORE_KEYS = [
 const translationCache = new Map<string, TranslationState>();
 const inFlightRequests = new Map<string, Promise<TranslationState>>();
 const persistentTranslationMemory = new Map<string, PersistentTranslationEntry>();
-const originalMessageHtml = new Map<string, string>();
+const translatedMessageState = new Map<string, { channelId: string; originalContent: string; translatedContent: string; }>();
+const pendingMessageMutations = new Map<string, {
+    channelId: string;
+    content: string;
+    originalContent: string;
+    translatedContent: string;
+}>();
 const requestQueue: Array<() => void> = [];
 const visibilitySubscribers = new Map<string, Set<(visible: boolean) => void>>();
 const observedMessageNodes = new Map<string, HTMLElement>();
 const messageVisibilityState = new Map<string, boolean>();
 const MAX_IN_MEMORY_TRANSLATIONS = 2500;
-const MAX_ACTIVE_DOM_REPLACEMENTS = 250;
+const ORIGINAL_CONTENT_FIELD = "vcLingoOriginalContent";
+const TRANSLATED_CONTENT_FIELD = "vcLingoTranslatedContent";
+const MESSAGE_MUTATION_FLUSH_BATCH_SIZE = 4;
+const MESSAGE_MUTATION_FLUSH_DELAY_MS = 60;
 let activeRequests = 0;
 let persistentCacheLoaded = false;
 let persistentCacheLoadPromise: Promise<void> | null = null;
 let persistMemoryTimer: ReturnType<typeof setTimeout> | null = null;
+let mutationFlushTimer: ReturnType<typeof setTimeout> | null = null;
 let sharedVisibilityObserver: IntersectionObserver | null = null;
+const scrollStateSubscribers = new Set<(isScrolling: boolean) => void>();
+const SCROLLING_KEYS = new Set(["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", "Space"]);
+let isScrollActive = false;
+let scrollIdleTimer: ReturnType<typeof setTimeout> | null = null;
+let windowScrollHandler: ((event: Event) => void) | null = null;
+let windowKeydownHandler: ((event: KeyboardEvent) => void) | null = null;
+let windowTouchMoveHandler: ((event: TouchEvent) => void) | null = null;
 
 function clearTranslationCaches() {
     translationCache.clear();
     inFlightRequests.clear();
     requestQueue.length = 0;
     activeRequests = 0;
+    clearPendingMessageMutations();
+}
+
+function setScrollActive(active: boolean) {
+    if (isScrollActive === active) return;
+    isScrollActive = active;
+    for (const subscriber of scrollStateSubscribers) {
+        subscriber(active);
+    }
+
+    if (!active && pendingMessageMutations.size > 0) {
+        scheduleMessageMutationFlush(20);
+    }
+}
+
+function markScrollActivity() {
+    setScrollActive(true);
+
+    if (scrollIdleTimer) {
+        clearTimeout(scrollIdleTimer);
+    }
+
+    scrollIdleTimer = setTimeout(() => {
+        scrollIdleTimer = null;
+        setScrollActive(false);
+    }, 900);
+}
+
+function subscribeToScrollState(onChange: (isScrolling: boolean) => void) {
+    scrollStateSubscribers.add(onChange);
+    onChange(isScrollActive);
+
+    return () => {
+        scrollStateSubscribers.delete(onChange);
+    };
 }
 
 function pruneInMemoryTranslationCache() {
@@ -100,6 +155,69 @@ function pruneInMemoryTranslationCache() {
         if (!oldestKey) break;
         translationCache.delete(oldestKey);
     }
+}
+
+function clearPendingMessageMutations() {
+    pendingMessageMutations.clear();
+
+    if (mutationFlushTimer) {
+        clearTimeout(mutationFlushTimer);
+        mutationFlushTimer = null;
+    }
+}
+
+function scheduleMessageMutationFlush(delay = MESSAGE_MUTATION_FLUSH_DELAY_MS) {
+    if (mutationFlushTimer) return;
+
+    mutationFlushTimer = setTimeout(() => {
+        mutationFlushTimer = null;
+        flushPendingMessageMutations();
+    }, delay);
+}
+
+function flushPendingMessageMutations() {
+    if (isScrollActive) {
+        scheduleMessageMutationFlush(150);
+        return;
+    }
+
+    let processed = 0;
+    for (const [messageId, mutation] of pendingMessageMutations) {
+        pendingMessageMutations.delete(messageId);
+
+        updateMessage(mutation.channelId, messageId, {
+            content: mutation.content,
+            [ORIGINAL_CONTENT_FIELD]: mutation.originalContent,
+            [TRANSLATED_CONTENT_FIELD]: mutation.translatedContent
+        } as any);
+
+        processed++;
+        if (processed >= MESSAGE_MUTATION_FLUSH_BATCH_SIZE) break;
+    }
+
+    if (pendingMessageMutations.size > 0) {
+        scheduleMessageMutationFlush();
+    }
+}
+
+function enqueueMessageMutation(messageId: string, mutation: {
+    channelId: string;
+    content: string;
+    originalContent: string;
+    translatedContent: string;
+}) {
+    const existing = pendingMessageMutations.get(messageId);
+    if (existing
+        && existing.channelId === mutation.channelId
+        && existing.content === mutation.content
+        && existing.originalContent === mutation.originalContent
+        && existing.translatedContent === mutation.translatedContent
+    ) {
+        return;
+    }
+
+    pendingMessageMutations.set(messageId, mutation);
+    scheduleMessageMutationFlush();
 }
 
 function notifyVisibilitySubscribers(messageId: string, isVisible: boolean) {
@@ -182,12 +300,14 @@ function subscribeToMessageVisibility(messageId: string, onChange: (isVisible: b
 
 function invalidateAllTranslations() {
     clearTranslationCaches();
-
-    for (const messageId of originalMessageHtml.keys()) {
-        restoreOriginalMessage(messageId);
+    for (const [messageId, entry] of translatedMessageState) {
+        updateMessage(entry.channelId, messageId, {
+            content: entry.originalContent,
+            [ORIGINAL_CONTENT_FIELD]: entry.originalContent,
+            [TRANSLATED_CONTENT_FIELD]: entry.translatedContent
+        } as any);
     }
-
-    originalMessageHtml.clear();
+    translatedMessageState.clear();
 }
 
 const settings = definePluginSettings({
@@ -462,13 +582,30 @@ function getTranslatorConfigFingerprint(): string {
     ].join("|");
 }
 
-function getMessageCacheKey(message: Message, translatorConfigFingerprint = getTranslatorConfigFingerprint()): string {
-    return `${message.id}:${message.content ?? ""}:${translatorConfigFingerprint}`;
+function getOriginalMessageContent(message: Message): string {
+    const lingoMessage = message as LingoMessage;
+    const original = lingoMessage[ORIGINAL_CONTENT_FIELD];
+    const translated = lingoMessage[TRANSLATED_CONTENT_FIELD];
+
+    if (typeof original === "string"
+        && typeof translated === "string"
+        && translated.length > 0
+        && (message.content ?? "") === translated
+    ) {
+        return original;
+    }
+
+    return message.content ?? "";
+}
+
+function getMessageCacheKey(messageId: string, sourceContent: string, translatorConfigFingerprint = getTranslatorConfigFingerprint()): string {
+    return `${messageId}:${sourceContent}:${translatorConfigFingerprint}`;
 }
 
 function shouldTranslateMessage(message: Message): boolean {
-    if (!message.content?.trim()) return false;
-    if (!shouldTranslateContent(message.content)) return false;
+    const sourceContent = getOriginalMessageContent(message);
+    if (!sourceContent.trim()) return false;
+    if (!shouldTranslateContent(sourceContent)) return false;
 
     const currentUserId = UserStore.getCurrentUser()?.id;
     if (!currentUserId) return true;
@@ -627,8 +764,8 @@ function scheduleTranslation<T>(task: () => Promise<T>): Promise<T> {
     });
 }
 
-function requestTranslation(message: Message, translatorConfigFingerprint: string): Promise<TranslationState> {
-    const key = getMessageCacheKey(message, translatorConfigFingerprint);
+function requestTranslation(messageId: string, sourceContent: string, translatorConfigFingerprint: string): Promise<TranslationState> {
+    const key = getMessageCacheKey(messageId, sourceContent, translatorConfigFingerprint);
 
     const cached = translationCache.get(key);
     if (cached) return Promise.resolve(cached);
@@ -637,14 +774,13 @@ function requestTranslation(message: Message, translatorConfigFingerprint: strin
     if (currentRequest) return currentRequest;
 
     const request = (async () => {
-        const messageText = message.content ?? "";
         const targetLanguage = normalizeTargetLanguage(settings.store.targetLanguage);
 
-        const persistentHit = await tryGetPersistentTranslation(messageText, translatorConfigFingerprint);
+        const persistentHit = await tryGetPersistentTranslation(sourceContent, translatorConfigFingerprint);
         if (persistentHit) return persistentHit;
 
-        const result = await scheduleTranslation(() => fetchTranslation(messageText, targetLanguage));
-        rememberPersistentTranslation(messageText, translatorConfigFingerprint, result);
+        const result = await scheduleTranslation(() => fetchTranslation(sourceContent, targetLanguage));
+        rememberPersistentTranslation(sourceContent, translatorConfigFingerprint, result);
         return result;
     })()
         .then(result => {
@@ -653,8 +789,8 @@ function requestTranslation(message: Message, translatorConfigFingerprint: strin
             return result;
         })
         .catch(error => {
-            const message = error instanceof Error ? error.message : "translation unavailable";
-            const fallback: TranslationState = { status: "error", message };
+            const errorMessage = error instanceof Error ? error.message : "translation unavailable";
+            const fallback: TranslationState = { status: "error", message: errorMessage };
             translationCache.set(key, fallback);
             pruneInMemoryTranslationCache();
             return fallback;
@@ -671,43 +807,62 @@ function getMessageNode(messageId: string) {
     return document.getElementById(`message-content-${messageId}`) as HTMLElement | null;
 }
 
-function restoreOriginalMessage(messageId: string) {
-    const messageNode = getMessageNode(messageId);
-    if (!messageNode) {
-        originalMessageHtml.delete(messageId);
+function restoreOriginalMessage(message: Message, sourceContent: string) {
+    const lingoMessage = message as LingoMessage;
+    const currentContent = message.content ?? "";
+    const originalContent = sourceContent;
+    const translatedContent =
+        typeof lingoMessage[TRANSLATED_CONTENT_FIELD] === "string"
+            ? lingoMessage[TRANSLATED_CONTENT_FIELD]
+            : "";
+
+    translatedMessageState.delete(message.id);
+
+    if (currentContent === originalContent && !pendingMessageMutations.has(message.id)) {
         return;
     }
 
-    const original = originalMessageHtml.get(messageId);
-    if (!original) {
-        delete messageNode.dataset.vcLingoTranslated;
-        delete messageNode.dataset.vcAutoSwedishTranslated;
-        return;
-    }
-
-    if (messageNode.dataset.vcLingoTranslated === "true" || messageNode.dataset.vcAutoSwedishTranslated === "true") {
-        messageNode.innerHTML = original;
-        delete messageNode.dataset.vcLingoTranslated;
-        delete messageNode.dataset.vcAutoSwedishTranslated;
-    }
-
-    originalMessageHtml.delete(messageId);
+    enqueueMessageMutation(message.id, {
+        channelId: message.channel_id,
+        content: originalContent,
+        originalContent,
+        translatedContent
+    });
 }
 
-function replaceMessageWithTranslation(messageId: string, translatedText: string) {
-    const messageNode = getMessageNode(messageId);
-    if (!messageNode) return;
-
-    if (!originalMessageHtml.has(messageId)) {
-        if (originalMessageHtml.size >= MAX_ACTIVE_DOM_REPLACEMENTS) {
-            return;
-        }
-
-        originalMessageHtml.set(messageId, messageNode.innerHTML);
+function applyTranslationToMessage(message: Message, sourceContent: string, translatedText: string) {
+    const lingoMessage = message as LingoMessage;
+    if ((message.content ?? "") === translatedText
+        && lingoMessage[ORIGINAL_CONTENT_FIELD] === sourceContent
+    ) {
+        return;
     }
 
-    messageNode.textContent = translatedText;
-    messageNode.dataset.vcLingoTranslated = "true";
+    translatedMessageState.set(message.id, {
+        channelId: message.channel_id,
+        originalContent: sourceContent,
+        translatedContent: translatedText
+    });
+
+    enqueueMessageMutation(message.id, {
+        channelId: message.channel_id,
+        content: translatedText,
+        originalContent: sourceContent,
+        translatedContent: translatedText
+    });
+}
+
+function replaceMessageWithTranslation(message: Message, sourceContent: string, translatedText: string) {
+    if (isScrollActive) {
+        // Never mutate message content while the user is actively scrolling.
+        return;
+    }
+
+    if (!getMessageNode(message.id)) {
+        return;
+    }
+
+    applyTranslationToMessage(message, sourceContent, translatedText);
 }
 
 function useMessageVisibility(messageId: string): boolean {
@@ -719,25 +874,22 @@ function useMessageVisibility(messageId: string): boolean {
             return;
         }
 
-        let disposed = false;
-        let attempts = 0;
+        const unsubscribe = subscribeToMessageVisibility(messageId, setVisible);
         let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-        const unsubscribe = subscribeToMessageVisibility(messageId, setVisible);
-
-        const attachObserver = () => {
-            if (disposed) return;
-            if (tryObserveMessageVisibility(messageId)) return;
-            if (attempts >= 40) return;
-
-            attempts++;
-            retryTimer = setTimeout(attachObserver, 50);
-        };
-
-        attachObserver();
+        if (!tryObserveMessageVisibility(messageId)) {
+            setVisible(false);
+            retryTimer = setTimeout(() => {
+                if (tryObserveMessageVisibility(messageId)) {
+                    const observedState = messageVisibilityState.get(messageId);
+                    if (typeof observedState === "boolean") {
+                        setVisible(observedState);
+                    }
+                }
+            }, 50);
+        }
 
         return () => {
-            disposed = true;
             if (retryTimer) {
                 clearTimeout(retryTimer);
             }
@@ -746,6 +898,16 @@ function useMessageVisibility(messageId: string): boolean {
     }, [messageId]);
 
     return isVisible;
+}
+
+function useScrollActivity(): boolean {
+    const [scrolling, setScrolling] = useState(isScrollActive);
+
+    useEffect(() => {
+        return subscribeToScrollState(setScrolling);
+    }, []);
+
+    return scrolling;
 }
 
 function LingoAccessory({ message }: { message: Message; }) {
@@ -766,31 +928,46 @@ function LingoAccessory({ message }: { message: Message; }) {
         azureRegion?.trim().toLowerCase() || "",
         azureApiKey?.trim() ? "with-key" : "no-key"
     ].join("|");
+    const sourceContent = getOriginalMessageContent(message);
     const [showOriginal, setShowOriginal] = useState(false);
     const [translation, setTranslation] = useState<TranslationState>(
-        () => translationCache.get(getMessageCacheKey(message, translatorConfigFingerprint)) ?? { status: "idle" }
+        () => translationCache.get(getMessageCacheKey(message.id, sourceContent, translatorConfigFingerprint)) ?? { status: "idle" }
     );
     const shouldTranslate = shouldTranslateMessage(message);
     const isVisible = useMessageVisibility(message.id);
+    const isScrolling = useScrollActivity();
+    const [visibilitySettled, setVisibilitySettled] = useState(!onlyTranslateVisible);
 
     useEffect(() => {
-        restoreOriginalMessage(message.id);
-        originalMessageHtml.delete(message.id);
-        setTranslation(translationCache.get(getMessageCacheKey(message, translatorConfigFingerprint)) ?? { status: "idle" });
-        setShowOriginal(false);
-    }, [message.id, message.content, translatorConfigFingerprint]);
+        if (!onlyTranslateVisible) {
+            setVisibilitySettled(true);
+            return;
+        }
 
-    useEffect(() => {
+        if (!isVisible) {
+            setVisibilitySettled(false);
+            return;
+        }
+
+        setVisibilitySettled(false);
+        const timer = setTimeout(() => {
+            setVisibilitySettled(true);
+        }, 220);
+
         return () => {
-            restoreOriginalMessage(message.id);
-            originalMessageHtml.delete(message.id);
+            clearTimeout(timer);
         };
-    }, [message.id]);
+    }, [message.id, onlyTranslateVisible, isVisible]);
 
     useEffect(() => {
-        if (!shouldTranslate || (onlyTranslateVisible && !isVisible)) return;
+        setTranslation(translationCache.get(getMessageCacheKey(message.id, sourceContent, translatorConfigFingerprint)) ?? { status: "idle" });
+        setShowOriginal(false);
+    }, [message.id, sourceContent, translatorConfigFingerprint]);
 
-        const key = getMessageCacheKey(message, translatorConfigFingerprint);
+    useEffect(() => {
+        if (!shouldTranslate || isScrolling || (onlyTranslateVisible && (!isVisible || !visibilitySettled))) return;
+
+        const key = getMessageCacheKey(message.id, sourceContent, translatorConfigFingerprint);
         const cached = translationCache.get(key);
         if (cached) {
             setTranslation(cached);
@@ -800,38 +977,44 @@ function LingoAccessory({ message }: { message: Message; }) {
         setTranslation({ status: "pending" });
         let cancelled = false;
 
-        requestTranslation(message, translatorConfigFingerprint).then(result => {
+        requestTranslation(message.id, sourceContent, translatorConfigFingerprint).then(result => {
             if (!cancelled) setTranslation(result);
         });
 
         return () => {
             cancelled = true;
         };
-    }, [message.id, message.content, shouldTranslate, isVisible, onlyTranslateVisible, translatorConfigFingerprint]);
+    }, [message.id, sourceContent, shouldTranslate, isVisible, visibilitySettled, onlyTranslateVisible, isScrolling, translatorConfigFingerprint]);
 
     useEffect(() => {
-        if (!shouldTranslate) return;
+        if (!shouldTranslate) {
+            restoreOriginalMessage(message, sourceContent);
+            return;
+        }
 
-        // Prevent async layout shifts while scrolling: do not mutate off-screen messages
-        // when visible-only mode is enabled.
-        if (onlyTranslateVisible && !isVisible) {
-            restoreOriginalMessage(message.id);
+        if (onlyTranslateVisible && (!isVisible || !visibilitySettled)) {
+            return;
+        }
+
+        if (isScrolling) {
             return;
         }
 
         if (translation.status === "ready" && !showOriginal) {
-            replaceMessageWithTranslation(message.id, translation.text);
+            replaceMessageWithTranslation(message, sourceContent, translation.text);
             return;
         }
 
-        restoreOriginalMessage(message.id);
-    }, [message.id, shouldTranslate, showOriginal, translation, onlyTranslateVisible, isVisible]);
+        if (showOriginal) {
+            restoreOriginalMessage(message, sourceContent);
+        }
+    }, [message, sourceContent, shouldTranslate, showOriginal, translation, onlyTranslateVisible, isVisible, visibilitySettled, isScrolling]);
 
     useEffect(() => {
         if (translation.status === "error") {
             setShowOriginal(true);
         }
-    }, [translation.status]);
+    }, [translation, message.id]);
 
     if (!shouldTranslate) return null;
 
@@ -865,14 +1048,47 @@ export default definePlugin({
     description: "Language-learning immersion plugin that auto-translates incoming messages to your target language.",
     authors: [{ name: "alrn", id: 0n }],
     settings,
-    dependencies: ["MessageAccessoriesAPI"],
+    dependencies: ["MessageAccessoriesAPI", "MessageUpdaterAPI"],
 
     start() {
+        windowScrollHandler = () => {
+            markScrollActivity();
+        };
+        windowKeydownHandler = event => {
+            if (SCROLLING_KEYS.has(event.key)) {
+                markScrollActivity();
+            }
+        };
+        windowTouchMoveHandler = () => {
+            markScrollActivity();
+        };
+        window.addEventListener("wheel", windowScrollHandler, { passive: true });
+        window.addEventListener("scroll", windowScrollHandler, { passive: true, capture: true });
+        window.addEventListener("keydown", windowKeydownHandler, { passive: true });
+        window.addEventListener("touchmove", windowTouchMoveHandler, { passive: true });
         addMessageAccessory(PLUGIN_ID, ({ message }) => <LingoAccessory message={message} />);
         void ensurePersistentMemoryLoaded();
     },
 
     stop() {
+        if (windowScrollHandler) {
+            window.removeEventListener("wheel", windowScrollHandler as EventListener);
+            window.removeEventListener("scroll", windowScrollHandler as EventListener, true);
+            windowScrollHandler = null;
+        }
+        if (windowKeydownHandler) {
+            window.removeEventListener("keydown", windowKeydownHandler);
+            windowKeydownHandler = null;
+        }
+        if (windowTouchMoveHandler) {
+            window.removeEventListener("touchmove", windowTouchMoveHandler);
+            windowTouchMoveHandler = null;
+        }
+        if (scrollIdleTimer) {
+            clearTimeout(scrollIdleTimer);
+            scrollIdleTimer = null;
+        }
+        setScrollActive(false);
         removeMessageAccessory(PLUGIN_ID);
         if (persistMemoryTimer) {
             clearTimeout(persistMemoryTimer);
