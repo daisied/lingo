@@ -16,7 +16,7 @@ Lingo removes friction by translating as messages appear, so Discord becomes dai
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$u='https://github.com/daisied/lingo/releases/latest/download/Lingo-Windows-NoNpm.zip';$z=Join-Path $env:TEMP 'Lingo-Windows-NoNpm.zip';$d=Join-Path $env:TEMP 'Lingo-Windows-NoNpm';if(Test-Path $d){Remove-Item $d -Recurse -Force};Invoke-WebRequest $u -OutFile $z;Expand-Archive -Path $z -DestinationPath $d -Force;Start-Process -FilePath (Join-Path $d 'install-stable.bat')"
 ```
 
-It is long because it does download, extract, and installer launch in one command. This is the fastest setup path for most users. If you want a source build/custom setup, use **Quick Start** below.
+> It is long because it does download, extract, and installer launch in one command. This is the fastest setup path for most users. If you want a source build/custom setup, use **Quick Start** below.
 
 ## Features
 
